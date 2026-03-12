@@ -3,3 +3,17 @@
 /CLAUDE.md
 /scripts
 /search-system-plan-v2.md
+
+# Node
+node_modules/
+.next/
+*.tgz
+
+# Go downloads
+*.tar.gz
+
+# Config with secrets (use .example instead)
+search-system/config/config.yaml
+
+# OS files
+.DS_Store
