@@ -1,5 +1,7 @@
 'use client'
 
+import { useState, useEffect } from 'react'
+
 interface TopBarProps {
   title: string
   live?: boolean
@@ -7,9 +9,12 @@ interface TopBarProps {
 }
 
 export function TopBar({ title, live, onToggleLive }: TopBarProps) {
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => { setMounted(true) }, [])
+
   const now = new Date()
-  const dateStr = now.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })
-  const timeStr = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  const dateStr = mounted ? now.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }) : ''
+  const timeStr = mounted ? now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false }) : ''
 
   return (
     <header className="h-14 border-b border-warm-border bg-white flex items-center px-6 gap-4 shrink-0">
