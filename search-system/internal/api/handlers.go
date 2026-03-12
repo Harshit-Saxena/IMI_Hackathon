@@ -3,9 +3,14 @@ package api
 import (
 	"database/sql"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yourusername/search-system/internal/dataset"
+	"github.com/yourusername/search-system/internal/metrics"
 	"github.com/yourusername/search-system/internal/outbox"
+	"github.com/yourusername/search-system/internal/search"
 	"github.com/yourusername/search-system/internal/upsert"
 )
 
@@ -26,15 +31,25 @@ SELECT id FROM ins`
 
 // Handler holds all HTTP route handlers.
 type Handler struct {
-	db     *sql.DB
-	engine *upsert.UpsertEngine
+	db           *sql.DB
+	engine       *upsert.UpsertEngine
+	metaStore    *dataset.MetaStore
+	searchRouter *search.SmartSearchRouter
 }
 
 // New constructs a Handler.
-func New(db *sql.DB, ob *outbox.Writer, cfg upsert.Config) *Handler {
+func New(
+	db *sql.DB,
+	ob *outbox.Writer,
+	cfg upsert.Config,
+	metaStore *dataset.MetaStore,
+	searchRouter *search.SmartSearchRouter,
+) *Handler {
 	return &Handler{
-		db:     db,
-		engine: upsert.New(db, ob, cfg),
+		db:           db,
+		engine:       upsert.New(db, ob, cfg),
+		metaStore:    metaStore,
+		searchRouter: searchRouter,
 	}
 }
 
@@ -101,7 +116,21 @@ func (h *Handler) BulkUpsert(c *gin.Context) {
 		}
 	}
 
+	t0 := time.Now()
 	result := h.engine.BulkUpsert(c.Request.Context(), datasetID, req.Records)
+	metrics.UpsertDuration.Observe(time.Since(t0).Seconds())
+
+	// Record per-record outcomes.
+	metrics.UpsertRecordsTotal.WithLabelValues("inserted").Add(float64(result.Inserted))
+	metrics.UpsertRecordsTotal.WithLabelValues("updated").Add(float64(result.Updated))
+	metrics.UpsertRecordsTotal.WithLabelValues("skipped").Add(float64(result.Skipped))
+	metrics.UpsertRecordsTotal.WithLabelValues("failed").Add(float64(result.Failed))
+
+	// Decay stability score and invalidate caches — the dataset has just been written.
+	if result.Total > 0 {
+		h.metaStore.OnDatasetChanged(c.Request.Context(), datasetID)           //nolint:errcheck
+		h.searchRouter.InvalidateDataset(c.Request.Context(), datasetID)
+	}
 
 	status := http.StatusOK
 	if result.Failed > 0 && result.Failed == result.Total {
@@ -131,11 +160,21 @@ func (h *Handler) FullSync(c *gin.Context) {
 		return
 	}
 
+	t0 := time.Now()
 	result, err := h.engine.FullSync(c.Request.Context(), datasetID, req.Records)
+	metrics.UpsertDuration.Observe(time.Since(t0).Seconds())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	metrics.UpsertRecordsTotal.WithLabelValues("inserted").Add(float64(result.Upserted.Inserted))
+	metrics.UpsertRecordsTotal.WithLabelValues("updated").Add(float64(result.Upserted.Updated))
+	metrics.UpsertRecordsTotal.WithLabelValues("skipped").Add(float64(result.Upserted.Skipped))
+	metrics.UpsertRecordsTotal.WithLabelValues("failed").Add(float64(result.Upserted.Failed))
+
+	// Decay stability score and invalidate caches — the dataset has just been synced.
+	h.metaStore.OnDatasetChanged(c.Request.Context(), datasetID) //nolint:errcheck
+	h.searchRouter.InvalidateDataset(c.Request.Context(), datasetID)
 
 	c.JSON(http.StatusOK, result)
 }
@@ -169,5 +208,53 @@ func (h *Handler) DeleteRecord(c *gin.Context) {
 		return
 	}
 
+	// Invalidate caches so deleted record is never served from cache.
+	h.searchRouter.InvalidateDataset(c.Request.Context(), datasetID)
+
 	c.JSON(http.StatusOK, gin.H{"deleted": recordID})
+}
+
+// Search handles GET /datasets/:id/search
+//
+// Query parameters:
+//
+//	q          required — search term (supports typos via fuzzy matching)
+//	limit      optional — max results (default 20, max 1000)
+//	offset     optional — pagination offset (default 0)
+//	fuzziness  optional — edit distance 0–2 (default 1; 2 = more typo tolerance)
+//
+// The router automatically selects Bleve in-memory (<100K records),
+// Bleve file-backed (100K–5M), or Elasticsearch (5M+, Phase 6).
+func (h *Handler) Search(c *gin.Context) {
+	datasetID := c.Param("id")
+
+	term := c.Query("q")
+	if term == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "q parameter is required"})
+		return
+	}
+
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	fuzziness, _ := strconv.Atoi(c.DefaultQuery("fuzziness", "1"))
+
+	if limit <= 0 || limit > 1000 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	result, err := h.searchRouter.Search(c.Request.Context(), datasetID, search.Query{
+		Term:      term,
+		Limit:     limit,
+		Offset:    offset,
+		Fuzziness: fuzziness,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
 }
