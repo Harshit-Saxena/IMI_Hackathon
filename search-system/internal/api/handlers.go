@@ -97,7 +97,7 @@ const listDatasetsSQL = `
 SELECT d.id, d.name, COALESCE(d.source,''),
        COALESCE(dc.record_count, 0),
        COALESCE(ds.stability_score, 0.0),
-       COALESCE(ds.state, 'NEW')
+       COALESCE(ds.current_tier, 'NEW')
 FROM datasets d
 LEFT JOIN dataset_counts dc ON dc.dataset_id = d.id
 LEFT JOIN dataset_states ds ON ds.dataset_id = d.id
