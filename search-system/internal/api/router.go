@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/yourusername/search-system/internal/config"
 	"github.com/yourusername/search-system/internal/dataset"
 	"github.com/yourusername/search-system/internal/metrics"
 	"github.com/yourusername/search-system/internal/outbox"
@@ -15,9 +16,21 @@ import (
 	"github.com/yourusername/search-system/internal/upsert"
 )
 
+// corsMiddleware allows cross-origin requests from the Next.js dashboard.
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
 // prometheusMiddleware records request count and latency for every route.
-// Uses c.FullPath() so labels contain route patterns, not param values
-// (e.g. "/datasets/:id/search" not "/datasets/abc123/search").
 func prometheusMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -40,13 +53,15 @@ func NewRouter(
 	db *sql.DB,
 	ob *outbox.Writer,
 	cfg upsert.Config,
+	appCfg config.Config,
 	metaStore *dataset.MetaStore,
 	searchRouter *search.SmartSearchRouter,
 ) *gin.Engine {
-	h := New(db, ob, cfg, metaStore, searchRouter)
+	h := New(db, ob, cfg, appCfg, metaStore, searchRouter)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
+	r.Use(corsMiddleware())
 	r.Use(prometheusMiddleware())
 
 	// ── Infrastructure ─────────────────────────────────────────────────────
@@ -58,29 +73,33 @@ func NewRouter(
 		c.JSON(http.StatusOK, gin.H{"status": "healthy"})
 	})
 	r.GET("/ready", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ready", "phase": "10"})
+		c.JSON(http.StatusOK, gin.H{"status": "ready", "phase": "15"})
 	})
 
 	// ── Prometheus metrics ─────────────────────────────────────────────────
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// ── Dataset management ─────────────────────────────────────────────────
+	r.GET("/datasets", h.ListDatasets)
 	r.POST("/datasets", h.CreateDataset)
 
 	// ── Record operations ──────────────────────────────────────────────────
 	datasets := r.Group("/datasets/:id")
 	{
-		// Phase 2: idempotent partial upsert (caller controls sync_token)
 		datasets.POST("/records/bulk", h.BulkUpsert)
-
-		// Phase 3: full source-of-truth sync — upsert batch + soft-delete stale
 		datasets.POST("/records/sync", h.FullSync)
-
-		// Phase 3: explicit single-record soft delete
 		datasets.DELETE("/records/:record_id", h.DeleteRecord)
-
-		// Phase 5: smart fuzzy search — routes to Bleve (memory/file) or ES based on tier
 		datasets.GET("/search", h.Search)
+	}
+
+	// ── Phase 15: Dashboard API endpoints ─────────────────────────────────
+	api := r.Group("/api")
+	{
+		api.GET("/system/stats", h.SystemStats)
+		api.GET("/system/health", h.SystemHealth)
+		api.GET("/activity", h.ActivityFeed)
+		api.GET("/performance", h.Performance)
+		api.GET("/datasets/:id/stats", h.DatasetStats)
 	}
 
 	return r

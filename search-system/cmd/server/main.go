@@ -224,7 +224,7 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	r := api.NewRouter(database, ob, engineCfg, metaStore, searchRouter)
+	r := api.NewRouter(database, ob, engineCfg, *cfg, metaStore, searchRouter)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.App.Port),
